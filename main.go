@@ -168,10 +168,24 @@ func (s *DHCPServer) handleRequest(pkt *dhcpv4.DHCPv4, macStr string, conn net.P
 }
 
 func (s *DHCPServer) handleRelease(pkt *dhcpv4.DHCPv4, macStr string) {
-	if lease, exists := s.leases[macStr]; exists {
-		log.Printf("Released lease for %s -> %s", macStr, lease.IP)
-		delete(s.leases, macStr)
+	lease, exists := s.leases[macStr]
+	if !exists {
+		log.Printf("Received release for unknown MAC %s", macStr)
+		return
 	}
+
+	// Dapatkan IP yang dilepas oleh client dari paket DHCPRELEASE
+	releasedIP := pkt.ClientIPAddr
+
+	// Periksa apakah IP yang dilepas cocok dengan yang ada di catatan lease kita
+	if !lease.IP.Equal(releasedIP) {
+		log.Printf("Warning: Client %s released IP %s, but our lease record has %s", macStr, releasedIP, lease.IP)
+		// Dalam kasus sederhana, kita tetap percaya pada MAC dan hapus lease-nya.
+		// Di lingkungan produksi, mungkin perlu penanganan lebih lanjut.
+	}
+
+	log.Printf("Released lease for %s -> %s", macStr, lease.IP)
+	delete(s.leases, macStr)
 }
 
 func (s *DHCPServer) sendOffer(pkt *dhcpv4.DHCPv4, ip net.IP, conn net.PacketConn, peer net.Addr) {
